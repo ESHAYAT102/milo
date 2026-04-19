@@ -11,12 +11,6 @@ Milo is a TUI inbox for reading received emails, searching through them, downloa
 ## Install
 
 ```bash
-npm install -g @esyt/milo
-```
-
-Or with Bun:
-
-```bash
 bun i -g @esyt/milo
 ```
 
@@ -24,7 +18,7 @@ If you are working from source:
 
 ```bash
 bun i
-bun run dev
+bun dev
 ```
 
 ## Setup
