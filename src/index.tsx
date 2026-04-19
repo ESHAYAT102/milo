@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { createCliRenderer } from "@opentui/core";
 import { createRoot, useKeyboard } from "@opentui/react";
 import { Buffer } from "node:buffer";

@@ -1,14 +1,36 @@
 {
-  "name": "milo",
-  "version": "0.0.1",
+  "name": "@esyt/milo",
+  "version": "0.1.0",
+  "description": "A keyboard-first terminal email client for Resend.",
   "module": "src/index.tsx",
   "type": "module",
-  "private": true,
-  "scripts": {
-    "dev": "bun run --watch src/index.tsx"
+  "bin": {
+    "milo": "./src/index.tsx"
   },
+  "files": [
+    "src",
+    "README.md",
+    "image.png"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "dev": "bun run --watch src/index.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "tui",
+    "email",
+    "resend",
+    "terminal",
+    "opentui"
+  ],
+  "license": "MIT",
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/node": "^25.6.0"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -16,7 +38,6 @@
   "dependencies": {
     "@opentui/core": "^0.1.99",
     "@opentui/react": "^0.1.99",
-    "@types/node": "^25.6.0",
     "react": "^19.2.4"
   }
 }
