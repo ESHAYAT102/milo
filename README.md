@@ -47,24 +47,25 @@ milo
 - Download received attachments to `~/Downloads`.
 - Compose new emails with `n`.
 - Reply to selected emails with `r`.
+- Send email with `Ctrl-S`.
 - Send outgoing attachments from local file paths.
 - Refresh the inbox by clicking the Milo logo.
 - Quit with `q`, `Esc`, or `Ctrl-C`.
 
 ## Keyboard Shortcuts
 
-| Key                 | Action                                                         |
-| ------------------- | -------------------------------------------------------------- |
-| `Up` / `Down`       | Move through the inbox                                         |
-| `/`                 | Search emails                                                  |
-| `Enter`             | Open highlighted search result or download selected attachment |
-| `n`                 | Compose a new email                                            |
-| `r`                 | Reply to the selected email                                    |
-| `a` or `i`          | Show received attachments                                      |
-| `Tab` / `Shift-Tab` | Move between compose/reply fields                              |
-| `Ctrl-S` / `Ctrl-Enter` | Send compose/reply email                                  |
-| `q`                 | Quit                                                           |
-| `Esc`               | Close modal or quit                                            |
+| Key                     | Action                                                         |
+| ----------------------- | -------------------------------------------------------------- |
+| `Up` / `Down`           | Move through the inbox                                         |
+| `/`                     | Search emails                                                  |
+| `Enter`                 | Open highlighted search result or download selected attachment |
+| `n`                     | Compose a new email                                            |
+| `r`                     | Reply to the selected email                                    |
+| `a` or `i`              | Show received attachments                                      |
+| `Tab` / `Shift-Tab`     | Move between compose/reply fields                              |
+| `Ctrl-S` / `Ctrl-Enter` | Send compose/reply email                                       |
+| `q`                     | Quit                                                           |
+| `Esc`                   | Close modal or quit                                            |
 
 ## Attachments
 

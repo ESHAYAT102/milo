@@ -15,6 +15,9 @@ import type {
 const RESEND_API_BASE = "https://api.resend.com";
 const INBOX_LIMIT = 50;
 const LOADER_FRAMES = ["⡁⠀⢈", "⠀⠶⠀", "⠰⣿⠆", "⢾⣉⡷", "⣏⠀⣹"];
+const MODAL_BACKGROUND_FG_DIM = 0.62;
+const MILO_DIR = join(homedir(), ".milo");
+const SENT_REPLIES_CACHE_PATH = join(MILO_DIR, "sent-replies.json");
 
 type AttachmentSummary = {
   id: string;
@@ -83,6 +86,24 @@ type SendEmailPayload = {
 type SendEmailResponse = {
   id: string;
 };
+
+type SentRepliesCache = Record<string, EmailDetail[]>;
+
+function dimHexColor(color: string): string {
+  const match = /^#([0-9a-f]{6})$/i.exec(color);
+
+  if (!match) return color;
+
+  const value = match[1]!;
+  const channels = [0, 2, 4].map((offset) => {
+    const channel = Number.parseInt(value.slice(offset, offset + 2), 16);
+    return Math.round(channel * MODAL_BACKGROUND_FG_DIM)
+      .toString(16)
+      .padStart(2, "0");
+  });
+
+  return `#${channels.join("")}`;
+}
 
 function isSendShortcut(key: { ctrl: boolean; name: string }): boolean {
   return key.ctrl && (key.name === "return" || key.name.toLowerCase() === "s");
@@ -228,6 +249,117 @@ function emailBody(email: EmailDetail | undefined): string {
   }
 
   return "This email does not include a text or HTML body.";
+}
+
+function headerValue(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  const lookup = name.toLowerCase();
+  const entry = Object.entries(headers ?? {}).find(
+    ([key]) => key.toLowerCase() === lookup,
+  );
+
+  return entry?.[1];
+}
+
+function normalizeMessageId(value: string | undefined): string | undefined {
+  return value?.trim().replace(/^<|>$/g, "");
+}
+
+function headerMentionsMessageId(
+  value: string | undefined,
+  messageId: string | null | undefined,
+): boolean {
+  const normalized = normalizeMessageId(messageId ?? undefined);
+
+  if (!value || !normalized) return false;
+
+  return value.includes(normalized) || value.includes(`<${normalized}>`);
+}
+
+function isReplyToEmail(
+  reply: EmailDetail,
+  parentMessageId: string | null | undefined,
+): boolean {
+  return (
+    headerMentionsMessageId(
+      headerValue(reply.headers, "In-Reply-To"),
+      parentMessageId,
+    ) ||
+    headerMentionsMessageId(
+      headerValue(reply.headers, "References"),
+      parentMessageId,
+    )
+  );
+}
+
+function replyPreviewLines(email: EmailDetail): string[] {
+  const lines = emailBody(email)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return lines.slice(0, 4);
+}
+
+function isEmailDetail(value: unknown): value is EmailDetail {
+  if (!value || typeof value !== "object") return false;
+
+  const email = value as Partial<EmailDetail>;
+
+  return (
+    typeof email.id === "string" &&
+    typeof email.from === "string" &&
+    Array.isArray(email.to) &&
+    email.to.every((address) => typeof address === "string") &&
+    typeof email.created_at === "string" &&
+    (typeof email.subject === "string" || email.subject === null) &&
+    (typeof email.text === "string" ||
+      email.text === null ||
+      email.text === undefined)
+  );
+}
+
+function parseSentRepliesCache(value: unknown): SentRepliesCache {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(
+        (entry): entry is [string, EmailDetail[]] =>
+          typeof entry[0] === "string" &&
+          Array.isArray(entry[1]) &&
+          entry[1].every(isEmailDetail),
+      )
+      .map(([emailId, replies]) => [emailId, replies]),
+  );
+}
+
+async function loadSentRepliesCache(): Promise<SentRepliesCache> {
+  try {
+    return parseSentRepliesCache(
+      JSON.parse(await readFile(SENT_REPLIES_CACHE_PATH, "utf8")),
+    );
+  } catch (error: unknown) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return {};
+    }
+
+    throw error;
+  }
+}
+
+async function saveSentRepliesCache(cache: SentRepliesCache): Promise<void> {
+  await mkdir(MILO_DIR, { recursive: true });
+  await writeFile(SENT_REPLIES_CACHE_PATH, `${JSON.stringify(cache, null, 2)}\n`);
 }
 
 function formatAddressList(addresses: string[] | null | undefined): string {
@@ -376,6 +508,10 @@ function App() {
   const [detailsById, setDetailsById] = useState<Record<string, EmailDetail>>(
     {},
   );
+  const [sentRepliesByEmailId, setSentRepliesByEmailId] = useState<
+    Record<string, EmailDetail[]>
+  >({});
+  const [repliesLoading, setRepliesLoading] = useState(false);
   const [state, setState] = useState<InboxState>({
     status: "loading",
     message: "Loading Resend...",
@@ -425,6 +561,7 @@ function App() {
   const composeBodyRef = useRef<TextareaRenderable | null>(null);
   const searchInputRef = useRef<InputRenderable | null>(null);
   const searchScrollRef = useRef<ScrollBoxRenderable | null>(null);
+  const replyDetailsRequestedRef = useRef<Set<string>>(new Set());
 
   const searchResults = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -452,10 +589,41 @@ function App() {
   const selectedDetail = selectedEmail
     ? detailsById[selectedEmail.id]
     : undefined;
+  const selectedParentMessageId =
+    selectedDetail?.message_id ?? selectedEmail?.message_id;
   const bodyLines = useMemo(
     () => emailBody(selectedDetail).split("\n"),
     [selectedDetail],
   );
+  const selectedReplies = useMemo(() => {
+    if (!selectedEmail || !selectedDetail) return [];
+
+    const receivedReplies = emails
+      .map((email) => detailsById[email.id])
+      .filter((detail): detail is EmailDetail => Boolean(detail))
+      .filter(
+        (detail) =>
+          detail.id !== selectedDetail.id &&
+          isReplyToEmail(detail, selectedParentMessageId),
+      );
+
+    return [
+      ...receivedReplies,
+      ...(sentRepliesByEmailId[selectedEmail.id] ?? []),
+    ]
+      .sort(
+        (left, right) =>
+          new Date(left.created_at).getTime() -
+          new Date(right.created_at).getTime(),
+      );
+  }, [
+    detailsById,
+    emails,
+    selectedDetail,
+    selectedEmail,
+    selectedParentMessageId,
+    sentRepliesByEmailId,
+  ]);
   const selectedAttachments = selectedEmail
     ? (attachmentsByEmailId[selectedEmail.id] ??
       selectedDetail?.attachments ??
@@ -468,6 +636,8 @@ function App() {
     replyModalOpen ||
     composeModalOpen ||
     searchModalOpen;
+  const backgroundFg = (color: string): string =>
+    modalOpen ? dimHexColor(color) : color;
   const replyToAddress = selectedDetail?.reply_to?.[0] ?? selectedEmail?.from;
   const replySubject = selectedEmail
     ? selectedEmail.subject?.toLowerCase().startsWith("re:")
@@ -480,6 +650,30 @@ function App() {
   const notify = useCallback((tone: Notification["tone"], message: string) => {
     setNotification({ id: Date.now(), tone, message });
   }, []);
+
+  useEffect(() => {
+    let canceled = false;
+
+    loadSentRepliesCache()
+      .then((cache) => {
+        if (!canceled) {
+          setSentRepliesByEmailId(cache);
+        }
+      })
+      .catch((error: unknown) => {
+        if (canceled) return;
+        notify(
+          "error",
+          error instanceof Error
+            ? error.message
+            : "Failed to load sent replies.",
+        );
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [notify]);
 
   useEffect(() => {
     if (!notification) return;
@@ -605,6 +799,66 @@ function App() {
     };
   }, [detailsById, selectedEmail]);
 
+  useEffect(() => {
+    if (!selectedDetail?.message_id) {
+      setRepliesLoading(false);
+      return;
+    }
+
+    const missingEmails = emails.filter(
+      (email) =>
+        email.id !== selectedDetail.id &&
+        !detailsById[email.id] &&
+        !replyDetailsRequestedRef.current.has(email.id),
+    );
+
+    if (missingEmails.length === 0) {
+      setRepliesLoading(false);
+      return;
+    }
+
+    let canceled = false;
+    for (const email of missingEmails) {
+      replyDetailsRequestedRef.current.add(email.id);
+    }
+    setRepliesLoading(true);
+
+    Promise.allSettled(
+      missingEmails.map((email) => getReceivedEmail(email.id)),
+    )
+      .then((results) => {
+        if (canceled) return;
+
+        const loadedDetails = results
+          .filter(
+            (result): result is PromiseFulfilledResult<EmailDetail> =>
+              result.status === "fulfilled",
+          )
+          .map((result) => result.value);
+
+        if (loadedDetails.length > 0) {
+          setDetailsById((current) => {
+            const next = { ...current };
+
+            for (const detail of loadedDetails) {
+              next[detail.id] = detail;
+            }
+
+            return next;
+          });
+        }
+      })
+      .finally(() => {
+        if (!canceled) {
+          setRepliesLoading(false);
+        }
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [detailsById, emails, selectedDetail]);
+
   const openAttachmentModal = useCallback(async () => {
     if (!selectedEmail) return;
 
@@ -704,8 +958,9 @@ function App() {
       replyAttachmentsRef.current?.value ??
       replyAttachmentPathsByEmailId[selectedEmail.id] ??
       "";
+    const trimmedReplyFromAddress = replyFromAddress.trim();
 
-    if (!replyFromAddress.trim()) {
+    if (!trimmedReplyFromAddress) {
       notify(
         "error",
         "Set POP_FROM or select an email with a To address",
@@ -724,20 +979,55 @@ function App() {
 
     try {
       const attachments = await buildOutgoingAttachments(attachmentPaths);
+      const replyHeaders = selectedParentMessageId
+        ? {
+            "In-Reply-To": selectedParentMessageId,
+            References: selectedParentMessageId,
+          }
+        : undefined;
       const response = await sendEmail({
-        from: replyFromAddress,
+        from: trimmedReplyFromAddress,
         to: [replyToAddress],
         subject: replySubject,
         text: body,
         ...(attachments.length ? { attachments } : {}),
-        ...(selectedEmail.message_id
-          ? {
-              headers: {
-                "In-Reply-To": selectedEmail.message_id,
-                References: selectedEmail.message_id,
-              },
-            }
-          : {}),
+        ...(replyHeaders ? { headers: replyHeaders } : {}),
+      });
+      const localReply: EmailDetail = {
+        id: response.id,
+        from: trimmedReplyFromAddress,
+        to: [replyToAddress],
+        created_at: new Date().toISOString(),
+        subject: replySubject,
+        text: body,
+        headers: replyHeaders,
+      };
+
+      const nextSentRepliesCache = {
+        ...sentRepliesByEmailId,
+        [selectedEmail.id]: [
+          ...(sentRepliesByEmailId[selectedEmail.id] ?? []),
+          localReply,
+        ],
+      };
+      setSentRepliesByEmailId(nextSentRepliesCache);
+      saveSentRepliesCache(nextSentRepliesCache).catch((error: unknown) => {
+        notify(
+          "error",
+          error instanceof Error
+            ? error.message
+            : "Reply sent, but could not cache it.",
+        );
+      });
+      setReplyDraftsByEmailId((current) => {
+        const next = { ...current };
+        delete next[selectedEmail.id];
+        return next;
+      });
+      setReplyAttachmentPathsByEmailId((current) => {
+        const next = { ...current };
+        delete next[selectedEmail.id];
+        return next;
       });
 
       setReplySendState("sent");
@@ -757,6 +1047,8 @@ function App() {
     replySubject,
     replyToAddress,
     selectedEmail,
+    selectedParentMessageId,
+    sentRepliesByEmailId,
   ]);
 
   const focusNextComposeField = useCallback(() => {
@@ -1094,7 +1386,6 @@ function App() {
       height={"100%"}
       flexDirection="row"
       gap={2}
-      backgroundColor={modalOpen ? "#08080d" : undefined}
     >
       <box
         width={36}
@@ -1102,18 +1393,17 @@ function App() {
         paddingX={2}
         paddingY={1}
         flexDirection="column"
-        backgroundColor={modalOpen ? "#0d0d14" : undefined}
       >
         <box
           onMouseDown={() => {
             void refreshInbox();
           }}
         >
-          <ascii-font font="tiny" text="Milo" />
+          <ascii-font font="tiny" text="Milo" color={backgroundFg("#c0caf5")} />
         </box>
         <text
           marginTop={2}
-          fg={state.status === "error" ? "#f7768e" : "#9ece6a"}
+          fg={backgroundFg(state.status === "error" ? "#f7768e" : "#9ece6a")}
           wrapMode="word"
           height={2}
         >
@@ -1139,13 +1429,19 @@ function App() {
                   selectEmail(email);
                 }}
               >
-                <text fg={selected ? "#c0caf5" : "#a9b1d6"} truncate>
+                <text
+                  fg={backgroundFg(selected ? "#c0caf5" : "#a9b1d6")}
+                  truncate
+                >
                   {email.from}
                 </text>
-                <text fg={selected ? "#7aa2f7" : "#565f89"} truncate>
+                <text
+                  fg={backgroundFg(selected ? "#7aa2f7" : "#565f89")}
+                  truncate
+                >
                   {email.subject || "(no subject)"}
                 </text>
-                <text fg="#565f89" truncate>
+                <text fg={backgroundFg("#565f89")} truncate>
                   {formatDate(email.created_at)}
                 </text>
               </box>
@@ -1160,30 +1456,35 @@ function App() {
         paddingX={2}
         paddingY={1}
         flexDirection="column"
-        backgroundColor={modalOpen ? "#0d0d14" : undefined}
       >
         {selectedEmail ? (
           <>
-            <text fg="#7aa2f7" marginBottom={1} wrapMode="word">
+            <text fg={backgroundFg("#7aa2f7")} marginBottom={1} wrapMode="word">
               {selectedEmail.subject || "(no subject)"}
             </text>
-            <text>From: {selectedDetail?.from ?? selectedEmail.from}</text>
-            <text>
+            <text fg={backgroundFg("#c0caf5")}>
+              From: {selectedDetail?.from ?? selectedEmail.from}
+            </text>
+            <text fg={backgroundFg("#c0caf5")}>
               To: {formatAddressList(selectedDetail?.to ?? selectedEmail.to)}
             </text>
-            <text>
+            <text fg={backgroundFg("#c0caf5")}>
               Cc: {formatAddressList(selectedDetail?.cc ?? selectedEmail.cc)}
             </text>
-            <text marginBottom={1}>
+            <text fg={backgroundFg("#c0caf5")} marginBottom={1}>
               Date: {formatDate(selectedEmail.created_at)}
             </text>
             {selectedAttachments.length > 0 ? (
               <box marginBottom={1} flexDirection="column">
-                <text fg="#9ece6a">
+                <text fg={backgroundFg("#9ece6a")}>
                   Attachments: {selectedAttachments.length}
                 </text>
                 {selectedAttachments.slice(0, 3).map((attachment) => (
-                  <text key={attachment.id} fg="#a9b1d6" truncate>
+                  <text
+                    key={attachment.id}
+                    fg={backgroundFg("#a9b1d6")}
+                    truncate
+                  >
                     {attachment.filename} ({formatFileSize(attachment.size)})
                   </text>
                 ))}
@@ -1197,18 +1498,82 @@ function App() {
             >
               {selectedDetail ? (
                 bodyLines.map((line, index) => (
-                  <text key={`${selectedEmail.id}-${index}`}>
+                  <text
+                    key={`${selectedEmail.id}-${index}`}
+                    fg={backgroundFg("#c0caf5")}
+                  >
                     {line || " "}
                   </text>
                 ))
               ) : (
-                <text fg="#e0af68">Loading selected email...</text>
+                <text fg={backgroundFg("#e0af68")}>
+                  Loading selected email...
+                </text>
+              )}
+            </box>
+            <box
+              border={["top"]}
+              paddingTop={1}
+              marginTop={1}
+              flexDirection="column"
+            >
+              <text fg={backgroundFg("#7aa2f7")} marginBottom={1}>
+                Replies
+                {repliesLoading
+                  ? " - loading..."
+                  : ` (${selectedReplies.length})`}
+              </text>
+              {selectedReplies.length > 0 ? (
+                selectedReplies.map((reply) => {
+                  const previewLines = replyPreviewLines(reply);
+
+                  return (
+                    <box
+                      key={`reply-${reply.id}`}
+                      border={["left"]}
+                      paddingLeft={1}
+                      marginBottom={1}
+                      flexDirection="column"
+                    >
+                      <text fg={backgroundFg("#a9b1d6")} truncate>
+                        From: {reply.from}
+                      </text>
+                      <text fg={backgroundFg("#565f89")} truncate>
+                        Date: {formatDate(reply.created_at)}
+                      </text>
+                      <text fg={backgroundFg("#7aa2f7")} truncate>
+                        {reply.subject || "(no subject)"}
+                      </text>
+                      {previewLines.length > 0 ? (
+                        previewLines.map((line, index) => (
+                          <text
+                            key={`${reply.id}-preview-${index}`}
+                            fg={backgroundFg("#c0caf5")}
+                            truncate
+                          >
+                            {line}
+                          </text>
+                        ))
+                      ) : (
+                        <text fg={backgroundFg("#565f89")}>
+                          No preview available.
+                        </text>
+                      )}
+                    </box>
+                  );
+                })
+              ) : (
+                <text fg={backgroundFg("#565f89")}>
+                  {repliesLoading
+                    ? "Checking this inbox for replies..."
+                    : "No replies found in this inbox."}
+                </text>
               )}
             </box>
           </>
         ) : (
           <box alignItems="center" justifyContent="center" flexGrow={1}>
-            <text fg="#565f89">
+            <text fg={backgroundFg("#565f89")}>
               {state.status === "loading"
                 ? `${LOADER_FRAMES[loaderFrameIndex]} Loading emails...`
                 : "No email selected."}
@@ -1473,7 +1838,6 @@ function App() {
           border
           paddingX={2}
           paddingY={1}
-          backgroundColor="#11111a"
           borderColor={
             notification.tone === "error"
               ? "#f7768e"
