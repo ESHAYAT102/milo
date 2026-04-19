@@ -62,7 +62,7 @@ milo
 | `r`                 | Reply to the selected email                                    |
 | `a` or `i`          | Show received attachments                                      |
 | `Tab` / `Shift-Tab` | Move between compose/reply fields                              |
-| `Ctrl-Enter`        | Send compose/reply email                                       |
+| `Ctrl-S` / `Ctrl-Enter` | Send compose/reply email                                  |
 | `q`                 | Quit                                                           |
 | `Esc`               | Close modal or quit                                            |
 

@@ -84,6 +84,10 @@ type SendEmailResponse = {
   id: string;
 };
 
+function isSendShortcut(key: { ctrl: boolean; name: string }): boolean {
+  return key.ctrl && (key.name === "return" || key.name.toLowerCase() === "s");
+}
+
 function apiKey(): string | undefined {
   const key = process.env.RESEND_API_KEY?.trim();
   return key ? key : undefined;
@@ -977,7 +981,7 @@ function App() {
         return;
       }
 
-      if (key.ctrl && key.name === "return") {
+      if (isSendShortcut(key)) {
         key.preventDefault();
         void sendComposedEmail();
         return;
@@ -1006,7 +1010,7 @@ function App() {
         return;
       }
 
-      if (key.ctrl && key.name === "return") {
+      if (isSendShortcut(key)) {
         key.preventDefault();
         void sendReplyEmail();
         return;
