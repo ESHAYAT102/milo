@@ -1,6 +1,6 @@
 {
   "name": "@esyt/milo",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A keyboard-first terminal email client for Resend.",
   "module": "src/index.tsx",
   "type": "module",
