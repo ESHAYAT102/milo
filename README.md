@@ -41,7 +41,9 @@ milo
 ## Features
 
 - Read received emails from Resend.
-- Navigate the inbox with arrow keys.
+- Switch between inbox and message panes with `Tab`.
+- Use arrow keys in the active pane: inbox selection on the left, message scrolling on the right.
+- Scroll the selected email with `j` / `k` or `PageUp` / `PageDown`.
 - Click inbox rows with the mouse.
 - Search emails with `/`.
 - Download received attachments to `~/Downloads`.
@@ -56,7 +58,11 @@ milo
 
 | Key                     | Action                                                         |
 | ----------------------- | -------------------------------------------------------------- |
-| `Up` / `Down`           | Move through the inbox                                         |
+| `Tab`                   | Switch between inbox and selected email panes                  |
+| `Up` / `Down`           | Move through inbox or scroll selected email in the active pane |
+| `j` / `k`               | Scroll selected email                                          |
+| `PageUp` / `PageDown`   | Scroll selected email faster                                   |
+| `Home` / `End`          | Jump to top or bottom of selected email                        |
 | `/`                     | Search emails                                                  |
 | `Enter`                 | Open highlighted search result or download selected attachment |
 | `n`                     | Compose a new email                                            |

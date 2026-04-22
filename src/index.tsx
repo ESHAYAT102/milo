@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 import { createCliRenderer } from "@opentui/core";
 import { createRoot, useKeyboard } from "@opentui/react";
 import { Buffer } from "node:buffer";
@@ -18,6 +19,8 @@ const LOADER_FRAMES = ["⡁⠀⢈", "⠀⠶⠀", "⠰⣿⠆", "⢾⣉⡷", "⣏�
 const MODAL_BACKGROUND_FG_DIM = 0.62;
 const MILO_DIR = join(homedir(), ".milo");
 const SENT_REPLIES_CACHE_PATH = join(MILO_DIR, "sent-replies.json");
+const ACTIVE_PANE_BORDER_COLOR = "#7aa2f7";
+const INACTIVE_PANE_BORDER_COLOR = "#414868";
 
 type AttachmentSummary = {
   id: string;
@@ -68,6 +71,8 @@ type Notification = {
 
 type ComposeField = "from" | "to" | "subject" | "attachments" | "body";
 type ReplyField = "attachments" | "body";
+type ActivePane = "inbox" | "detail";
+type ScrollUnit = "absolute" | "viewport" | "content" | "step";
 
 type OutgoingAttachment = {
   filename: string;
@@ -220,33 +225,158 @@ async function getReceivedEmailAttachment(
   );
 }
 
-function cleanHtml(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<\/(p|div|h[1-6]|li|tr|blockquote)>/gi, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+const HTML_ENTITIES: Record<string, string> = {
+  amp: "&",
+  apos: "'",
+  gt: ">",
+  lt: "<",
+  nbsp: " ",
+  quot: '"',
+};
+
+const CSS_TOKEN_PATTERN =
+  /\b(?:background(?:-color)?|border(?:-(?:bottom|color|radius|top))?|color|font(?:-(?:family|size|weight))?|line-height|margin|padding|text-decoration)\s*:|!important|@media\b|(?:^|\s)[.#][a-z0-9_-]+\s*\{/gi;
+const CSS_BLOCK_START_PATTERN =
+  /(?:^|\n)\s*(?:@(?:font-face|media|supports|keyframes)[^{]*|(?:[#.][\w-]+|\[[^\]]+\]|(?:a|article|body|button|div|footer|h[1-6]|header|html|img|li|main|ol|p|section|span|table|tbody|td|th|thead|tr|ul)\b)(?:[\s>+~:,.[#\]\(\)"'=\w-])*)\s*\{/gi;
+const CSS_DECLARATION_LINE_PATTERN =
+  /^\s*(?:[-\w]+)\s*:\s*[^;\n]+;?\s*$/;
+
+function decodeHtmlEntities(value: string): string {
+  return value.replace(
+    /&(#x[0-9a-f]+|#[0-9]+|[a-z][a-z0-9]+);/gi,
+    (match, entity: string) => {
+      const normalized = entity.toLowerCase();
+
+      if (normalized.startsWith("#x")) {
+        const codePoint = Number.parseInt(normalized.slice(2), 16);
+        return codePoint > 0x10ffff ? match : String.fromCodePoint(codePoint);
+      }
+
+      if (normalized.startsWith("#")) {
+        const codePoint = Number.parseInt(normalized.slice(1), 10);
+        return codePoint > 0x10ffff ? match : String.fromCodePoint(codePoint);
+      }
+
+      return HTML_ENTITIES[normalized] ?? match;
+    },
+  );
+}
+
+function normalizeBodyWhitespace(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function stripCssRules(value: string): string {
+  const withoutTaggedCss = value
+    .replace(/<style\b[\s\S]*?(?:<\/style>|$)/gi, "")
+    .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, "")
+    .replace(/<head\b[\s\S]*?(?:<\/head>|$)/gi, "")
+
+  let index = 0;
+  let clean = "";
+
+  while (index < withoutTaggedCss.length) {
+    CSS_BLOCK_START_PATTERN.lastIndex = index;
+    const match = CSS_BLOCK_START_PATTERN.exec(withoutTaggedCss);
+
+    if (!match) {
+      clean += withoutTaggedCss.slice(index);
+      break;
+    }
+
+    const blockStart = match.index;
+    const braceStart = CSS_BLOCK_START_PATTERN.lastIndex - 1;
+    let depth = 1;
+    let cursor = braceStart + 1;
+
+    while (cursor < withoutTaggedCss.length && depth > 0) {
+      const character = withoutTaggedCss[cursor];
+
+      if (character === "{") depth += 1;
+      if (character === "}") depth -= 1;
+      cursor += 1;
+    }
+
+    if (depth > 0) {
+      clean += withoutTaggedCss.slice(index);
+      break;
+    }
+
+    clean += withoutTaggedCss.slice(index, blockStart);
+    clean += "\n";
+    index = cursor;
+  }
+
+  return clean
+    .split("\n")
+    .filter((line) => !CSS_DECLARATION_LINE_PATTERN.test(line))
+    .join("\n");
+}
+
+function countCssTokens(value: string): number {
+  return value.match(CSS_TOKEN_PATTERN)?.length ?? 0;
+}
+
+function isLikelyBrokenTextBody(text: string): boolean {
+  const cssTokens = countCssTokens(text);
+  const structuralNoise = text.match(/[{};]/g)?.length ?? 0;
+
+  return (
+    /<\/?(?:html|body|table|style|script|div|span|p|a|br)\b/i.test(text) ||
+    cssTokens >= 3 ||
+    (cssTokens > 0 && structuralNoise >= 12)
+  );
+}
+
+function containsHtmlTags(text: string): boolean {
+  return /<\/?[a-z][\s\S]*?>/i.test(text);
+}
+
+function cleanPlainText(text: string): string {
+  return normalizeBodyWhitespace(decodeHtmlEntities(stripCssRules(text)));
+}
+
+function cleanHtml(html: string): string {
+  return normalizeBodyWhitespace(
+    decodeHtmlEntities(
+      stripCssRules(html)
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/<li\b[^>]*>/gi, "\n- ")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(
+          /<\/(?:p|div|h[1-6]|li|tr|table|section|article|blockquote)>/gi,
+          "\n",
+        )
+        .replace(/<[^>]+>/g, ""),
+    ),
+  );
 }
 
 function emailBody(email: EmailDetail | undefined): string {
   if (!email) return "";
 
-  if (email.text?.trim()) {
-    return email.text.trim();
+  const text = email.text?.trim();
+  const html = email.html?.trim();
+  const textLooksBroken = text ? isLikelyBrokenTextBody(text) : false;
+  const cleanedText = text
+    ? containsHtmlTags(text)
+      ? cleanHtml(text)
+      : cleanPlainText(text)
+    : "";
+  const cleanedHtml = html ? cleanHtml(html) : "";
+
+  if (cleanedText && !textLooksBroken) {
+    return cleanedText;
   }
 
-  if (email.html?.trim()) {
-    return cleanHtml(email.html);
-  }
+  if (cleanedHtml) return cleanedHtml;
+  if (cleanedText) return cleanedText;
 
   return "This email does not include a text or HTML body.";
 }
@@ -550,7 +680,9 @@ function App() {
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
+  const [activePane, setActivePane] = useState<ActivePane>("inbox");
   const inboxScrollRef = useRef<ScrollBoxRenderable | null>(null);
+  const detailScrollRef = useRef<ScrollBoxRenderable | null>(null);
   const attachmentScrollRef = useRef<ScrollBoxRenderable | null>(null);
   const replyTextareaRef = useRef<TextareaRenderable | null>(null);
   const replyAttachmentsRef = useRef<InputRenderable | null>(null);
@@ -651,6 +783,21 @@ function App() {
     setNotification({ id: Date.now(), tone, message });
   }, []);
 
+  const syncSelectedDetailScroll = useCallback(() => {
+    const scrollbox = detailScrollRef.current;
+
+    if (!scrollbox) return;
+
+    scrollbox.content.translateY = -scrollbox.scrollTop;
+    scrollbox.content.translateX = -scrollbox.scrollLeft;
+    scrollbox.requestRender();
+  }, []);
+
+  const resetSelectedDetailScroll = useCallback(() => {
+    detailScrollRef.current?.scrollTo({ x: 0, y: 0 });
+    syncSelectedDetailScroll();
+  }, [syncSelectedDetailScroll]);
+
   useEffect(() => {
     let canceled = false;
 
@@ -741,8 +888,9 @@ function App() {
 
     queueMicrotask(() => {
       inboxScrollRef.current?.scrollChildIntoView(inboxRowId(selectedEmail.id));
+      resetSelectedDetailScroll();
     });
-  }, [selectedEmail?.id]);
+  }, [resetSelectedDetailScroll, selectedEmail?.id]);
 
   useEffect(() => {
     if (!attachmentModalOpen || !selectedAttachment) return;
@@ -1133,6 +1281,19 @@ function App() {
     [emails.length, selectedIndex],
   );
 
+  const scrollSelectedDetail = useCallback(
+    (delta: number, unit: ScrollUnit = "viewport") => {
+      detailScrollRef.current?.scrollBy(delta, unit);
+      syncSelectedDetailScroll();
+    },
+    [syncSelectedDetailScroll],
+  );
+
+  const scrollSelectedDetailTo = useCallback((position: number) => {
+    detailScrollRef.current?.scrollTo(position);
+    syncSelectedDetailScroll();
+  }, [syncSelectedDetailScroll]);
+
   const sendComposedEmail = useCallback(async () => {
     const body = composeBodyRef.current?.plainText.trim() ?? "";
     const to = parseAddressList(composeTo);
@@ -1341,22 +1502,66 @@ function App() {
       }
     }
 
+    if (key.name === "tab") {
+      key.preventDefault();
+      setActivePane((pane) => (pane === "inbox" ? "detail" : "inbox"));
+      return;
+    }
+
+    if (key.name === "up") {
+      key.preventDefault();
+
+      if (activePane === "detail") {
+        scrollSelectedDetail(-1, "absolute");
+      } else {
+        moveInboxSelection(-1);
+      }
+
+      return;
+    }
+
+    if (key.name === "down") {
+      key.preventDefault();
+
+      if (activePane === "detail") {
+        scrollSelectedDetail(1, "absolute");
+      } else {
+        moveInboxSelection(1);
+      }
+
+      return;
+    }
+
+    if (key.name === "pageup" || key.name === "k") {
+      key.preventDefault();
+      scrollSelectedDetail(-0.5);
+      return;
+    }
+
+    if (key.name === "pagedown" || key.name === "j") {
+      key.preventDefault();
+      scrollSelectedDetail(0.5);
+      return;
+    }
+
+    if (key.name === "home" || (key.name === "up" && key.shift)) {
+      key.preventDefault();
+      scrollSelectedDetailTo(0);
+      return;
+    }
+
+    if (key.name === "end" || (key.name === "down" && key.shift)) {
+      key.preventDefault();
+      scrollSelectedDetail(1, "content");
+      return;
+    }
+
     if (
       key.name === "q" ||
       key.name === "escape" ||
       (key.ctrl && key.name === "c")
     ) {
       process.exit(0);
-    }
-
-    if (key.name === "up") {
-      key.preventDefault();
-      moveInboxSelection(-1);
-    }
-
-    if (key.name === "down") {
-      key.preventDefault();
-      moveInboxSelection(1);
     }
 
     if (key.name === "r") {
@@ -1390,6 +1595,12 @@ function App() {
       <box
         width={36}
         border
+        borderColor={
+          activePane === "inbox"
+            ? ACTIVE_PANE_BORDER_COLOR
+            : INACTIVE_PANE_BORDER_COLOR
+        }
+        focusedBorderColor={ACTIVE_PANE_BORDER_COLOR}
         paddingX={2}
         paddingY={1}
         flexDirection="column"
@@ -1399,7 +1610,7 @@ function App() {
             void refreshInbox();
           }}
         >
-          <ascii-font font="tiny" text="Milo" color={backgroundFg("#c0caf5")} />
+          <ascii-font marginBottom={1} font="tiny" text="Milo" color={backgroundFg("#c0caf5")} />
         </box>
         <text
           marginTop={2}
@@ -1411,7 +1622,12 @@ function App() {
             ? `${LOADER_FRAMES[loaderFrameIndex]} ${state.message}`
             : state.message}
         </text>
-        <scrollbox ref={inboxScrollRef} marginTop={1} flexGrow={1} focused>
+        <scrollbox
+          ref={inboxScrollRef}
+          marginTop={0}
+          flexGrow={1}
+          focused={activePane === "inbox"}
+        >
           {emails.map((email) => {
             const selected = email.id === selectedEmail?.id;
 
@@ -1426,6 +1642,7 @@ function App() {
                 marginBottom={1}
                 backgroundColor={selected ? "#1a1b26" : undefined}
                 onMouseDown={() => {
+                  setActivePane("inbox");
                   selectEmail(email);
                 }}
               >
@@ -1450,12 +1667,26 @@ function App() {
         </scrollbox>
       </box>
 
-      <box
+      <scrollbox
+        ref={detailScrollRef}
         flexGrow={1}
+        height={"100%"}
         border
+        borderColor={
+          activePane === "detail"
+            ? ACTIVE_PANE_BORDER_COLOR
+            : INACTIVE_PANE_BORDER_COLOR
+        }
+        focusedBorderColor={ACTIVE_PANE_BORDER_COLOR}
         paddingX={2}
         paddingY={1}
-        flexDirection="column"
+        focused={activePane === "detail"}
+        onMouseDown={() => {
+          setActivePane("detail");
+        }}
+        scrollY
+        scrollX={false}
+        contentOptions={{ flexDirection: "column" }}
       >
         {selectedEmail ? (
           <>
@@ -1501,6 +1732,7 @@ function App() {
                   <text
                     key={`${selectedEmail.id}-${index}`}
                     fg={backgroundFg("#c0caf5")}
+                    wrapMode="word"
                   >
                     {line || " "}
                   </text>
@@ -1580,7 +1812,7 @@ function App() {
             </text>
           </box>
         )}
-      </box>
+      </scrollbox>
       {attachmentModalOpen ? (
         <box
           position="absolute"
@@ -1846,6 +2078,18 @@ function App() {
                 : "#7aa2f7"
           }
         >
+          <box
+            position="absolute"
+            left={1}
+            right={1}
+            top={1}
+            bottom={1}
+            flexDirection="column"
+          >
+            <text>{" ".repeat(40)}</text>
+            <text>{" ".repeat(40)}</text>
+            <text>{" ".repeat(40)}</text>
+          </box>
           <text
             fg={
               notification.tone === "error"
