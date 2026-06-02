@@ -2,11 +2,14 @@
 
 import { createCliRenderer } from "@opentui/core";
 import { createRoot, useKeyboard } from "@opentui/react";
+import { Jimp } from "jimp";
 import { Buffer } from "node:buffer";
+import { spawn } from "node:child_process";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type React from "react";
 import type {
   InputRenderable,
   ScrollBoxRenderable,
@@ -21,6 +24,9 @@ const MILO_DIR = join(homedir(), ".milo");
 const SENT_REPLIES_CACHE_PATH = join(MILO_DIR, "sent-replies.json");
 const ACTIVE_PANE_BORDER_COLOR = "#7aa2f7";
 const INACTIVE_PANE_BORDER_COLOR = "#414868";
+const MAX_INLINE_IMAGES = 4;
+const INLINE_IMAGE_WIDTH = 48;
+const INLINE_IMAGE_HEIGHT = 18;
 
 type AttachmentSummary = {
   id: string;
@@ -94,6 +100,22 @@ type SendEmailResponse = {
 
 type SentRepliesCache = Record<string, EmailDetail[]>;
 
+type InlineImage = {
+  alt: string;
+  src: string;
+};
+
+type RenderedInlineImage = InlineImage & {
+  lines: { top: string; bottom: string }[][];
+};
+
+type RenderedInlineImageSlot = RenderedInlineImage | null;
+
+type EmailDisplayLine =
+  | { kind: "text"; text: string }
+  | { kind: "link"; label: string; href: string }
+  | { kind: "image"; imageIndex: number };
+
 function dimHexColor(color: string): string {
   const match = /^#([0-9a-f]{6})$/i.exec(color);
 
@@ -108,6 +130,18 @@ function dimHexColor(color: string): string {
   });
 
   return `#${channels.join("")}`;
+}
+
+function notificationBackground(tone: Notification["tone"]): string {
+  if (tone === "error") return "#7f1d1d";
+  if (tone === "success") return "#14532d";
+  return "#1e3a8a";
+}
+
+function notificationForeground(tone: Notification["tone"]): string {
+  if (tone === "error") return "#fecaca";
+  if (tone === "success") return "#dcfce7";
+  return "#dbeafe";
 }
 
 function isSendShortcut(key: { ctrl: boolean; name: string }): boolean {
@@ -343,10 +377,26 @@ function cleanPlainText(text: string): string {
 }
 
 function cleanHtml(html: string): string {
+  let imageIndex = 0;
+
   return normalizeBodyWhitespace(
     decodeHtmlEntities(
       stripCssRules(html)
         .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/<img\b[^>]*>/gi, () => `\n[[milo:image:${imageIndex++}]]\n`)
+        .replace(
+          /<a\b[^>]*\bhref=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi,
+          (_match, _quote: string, href: string, label: string) => {
+            const cleanLabel = label.replace(/<[^>]+>/g, "").trim();
+            const cleanHref = decodeHtmlEntities(href).trim();
+
+            if (/\[\[milo:image:\d+]]/.test(cleanLabel)) return cleanLabel;
+            if (!cleanHref) return cleanLabel;
+            if (!cleanLabel || cleanLabel === cleanHref) return cleanHref;
+
+            return `${cleanLabel} (${cleanHref})`;
+          },
+        )
         .replace(/<li\b[^>]*>/gi, "\n- ")
         .replace(/<br\s*\/?>/gi, "\n")
         .replace(
@@ -356,6 +406,243 @@ function cleanHtml(html: string): string {
         .replace(/<[^>]+>/g, ""),
     ),
   );
+}
+
+function extractHtmlImages(html: string | null | undefined): InlineImage[] {
+  if (!html) return [];
+
+  return [...html.matchAll(/<img\b([^>]*)>/gi)]
+    .map((match) => {
+      const attributes = match[1] ?? "";
+      const src = attributeValue(attributes, "src");
+
+      if (!src) return undefined;
+
+      return {
+        alt: attributeValue(attributes, "alt") ?? "image",
+        src: decodeHtmlEntities(src).trim(),
+      };
+    })
+    .filter((image): image is InlineImage => Boolean(image?.src))
+    .slice(0, MAX_INLINE_IMAGES);
+}
+
+function attributeValue(attributes: string, name: string): string | undefined {
+  const match = new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, "i").exec(
+    attributes,
+  );
+
+  return match?.[2];
+}
+
+async function inlineImageBuffer(
+  image: InlineImage,
+  attachments: AttachmentSummary[],
+): Promise<Buffer> {
+  if (image.src.startsWith("data:")) {
+    const match = /^data:image\/[a-z0-9.+-]+;base64,(.+)$/i.exec(image.src);
+
+    if (!match) throw new Error("Unsupported data image.");
+
+    return Buffer.from(match[1]!, "base64");
+  }
+
+  if (image.src.toLowerCase().startsWith("cid:")) {
+    const cid = image.src.slice(4).replace(/^<|>$/g, "");
+    const attachment = attachments.find(
+      (item) => item.content_id?.replace(/^<|>$/g, "") === cid,
+    );
+
+    if (!attachment?.download_url) {
+      throw new Error(`Missing image attachment for cid:${cid}.`);
+    }
+
+    return await fetchBuffer(attachment.download_url);
+  }
+
+  if (/^https?:\/\//i.test(image.src)) {
+    return await fetchBuffer(image.src);
+  }
+
+  throw new Error("Unsupported image URL.");
+}
+
+async function fetchBuffer(url: string): Promise<Buffer> {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Image download failed: ${response.status}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
+function rgbHex(data: Buffer | Uint8Array, index: number): string {
+  return `#${[data[index], data[index + 1], data[index + 2]]
+    .map((value) => (value ?? 0).toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+async function renderInlineImage(
+  image: InlineImage,
+  attachments: AttachmentSummary[],
+): Promise<RenderedInlineImage> {
+  const buffer = await inlineImageBuffer(image, attachments);
+  const decoded = await Jimp.read(buffer);
+  const scale = Math.min(
+    INLINE_IMAGE_WIDTH / decoded.bitmap.width,
+    (INLINE_IMAGE_HEIGHT * 2) / decoded.bitmap.height,
+    1,
+  );
+  const width = Math.max(1, Math.floor(decoded.bitmap.width * scale));
+  const height = Math.max(2, Math.floor(decoded.bitmap.height * scale));
+
+  decoded.resize({ w: width, h: height });
+
+  const rows: RenderedInlineImage["lines"] = [];
+
+  for (let y = 0; y < decoded.bitmap.height; y += 2) {
+    const row: { top: string; bottom: string }[] = [];
+
+    for (let x = 0; x < decoded.bitmap.width; x += 1) {
+      const top = (y * decoded.bitmap.width + x) * 4;
+      const bottomY = Math.min(y + 1, decoded.bitmap.height - 1);
+      const bottom = (bottomY * decoded.bitmap.width + x) * 4;
+
+      row.push({
+        top: rgbHex(decoded.bitmap.data, top),
+        bottom: rgbHex(decoded.bitmap.data, bottom),
+      });
+    }
+
+    rows.push(row);
+  }
+
+  return { ...image, lines: rows };
+}
+
+function openUrl(url: string): void {
+  const command =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "cmd"
+        : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+
+  spawn(command, args, {
+    detached: true,
+    stdio: "ignore",
+  }).unref();
+}
+
+const URL_PATTERN = /https?:\/\/[^\s<>)\]]+/gi;
+const BRACKETED_URL_PATTERN = /^\[(https?:\/\/[^\]]+)\]$/i;
+const LABELED_URL_PATTERN = /^(.*?)\s*\((https?:\/\/[^)]+)\)$/i;
+const INLINE_IMAGE_MARKER_PATTERN = /^\[\[milo:image:(\d+)]]$/;
+
+function normalizeUrl(value: string): string {
+  return value.trim().replace(/[.,;:!?]+$/g, "");
+}
+
+function sameUrl(left: string, right: string): boolean {
+  return normalizeUrl(left) === normalizeUrl(right);
+}
+
+function isStandaloneImageUrl(line: string, images: InlineImage[]): boolean {
+  const url = normalizeUrl(line.replace(/^\[|\]$/g, ""));
+
+  return images.some((image) => sameUrl(image.src, url));
+}
+
+function displayLinkLabel(value: string, fallback: string): string {
+  const clean = value.trim().replace(/\s+/g, " ");
+
+  if (!clean || /^https?:\/\//i.test(clean)) {
+    try {
+      return new URL(fallback).hostname;
+    } catch {
+      return "Open link";
+    }
+  }
+
+  return clean;
+}
+
+function bodyDisplayLines(
+  lines: string[],
+  images: InlineImage[],
+): EmailDisplayLine[] {
+  const displayLines: EmailDisplayLine[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      displayLines.push({ kind: "text", text: "" });
+      continue;
+    }
+
+    const imageMarker = INLINE_IMAGE_MARKER_PATTERN.exec(line);
+
+    if (imageMarker) {
+      const imageIndex = Number.parseInt(imageMarker[1]!, 10);
+
+      if (images[imageIndex]) {
+        displayLines.push({ kind: "image", imageIndex });
+      }
+
+      continue;
+    }
+
+    if (isStandaloneImageUrl(line, images)) continue;
+
+    const bracketedUrl = BRACKETED_URL_PATTERN.exec(line);
+
+    if (bracketedUrl) {
+      const previous = displayLines[displayLines.length - 1];
+      const href = normalizeUrl(bracketedUrl[1]!);
+
+      if (
+        previous?.kind === "text" &&
+        previous.text.trim() &&
+        previous.text.length <= 80
+      ) {
+        displayLines[displayLines.length - 1] = {
+          kind: "link",
+          label: displayLinkLabel(previous.text, href),
+          href,
+        };
+      } else {
+        displayLines.push({
+          kind: "link",
+          label: displayLinkLabel("", href),
+          href,
+        });
+      }
+
+      continue;
+    }
+
+    const labeledUrl = LABELED_URL_PATTERN.exec(line);
+
+    if (labeledUrl) {
+      const href = normalizeUrl(labeledUrl[2]!);
+
+      if (!isStandaloneImageUrl(href, images)) {
+        displayLines.push({
+          kind: "link",
+          label: displayLinkLabel(labeledUrl[1]!, href),
+          href,
+        });
+        continue;
+      }
+    }
+
+    displayLines.push({ kind: "text", text: rawLine });
+  }
+
+  return displayLines;
 }
 
 function emailBody(email: EmailDetail | undefined): string {
@@ -370,6 +657,10 @@ function emailBody(email: EmailDetail | undefined): string {
       : cleanPlainText(text)
     : "";
   const cleanedHtml = html ? cleanHtml(html) : "";
+
+  if (html && extractHtmlImages(html).length > 0 && cleanedHtml) {
+    return cleanedHtml;
+  }
 
   if (cleanedText && !textLooksBroken) {
     return cleanedText;
@@ -681,6 +972,9 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
   const [activePane, setActivePane] = useState<ActivePane>("inbox");
+  const [renderedImagesByEmailId, setRenderedImagesByEmailId] = useState<
+    Record<string, RenderedInlineImageSlot[]>
+  >({});
   const inboxScrollRef = useRef<ScrollBoxRenderable | null>(null);
   const detailScrollRef = useRef<ScrollBoxRenderable | null>(null);
   const attachmentScrollRef = useRef<ScrollBoxRenderable | null>(null);
@@ -727,6 +1021,17 @@ function App() {
     () => emailBody(selectedDetail).split("\n"),
     [selectedDetail],
   );
+  const selectedInlineImages = useMemo(
+    () => extractHtmlImages(selectedDetail?.html),
+    [selectedDetail?.html],
+  );
+  const displayLines = useMemo(
+    () => bodyDisplayLines(bodyLines, selectedInlineImages),
+    [bodyLines, selectedInlineImages],
+  );
+  const selectedRenderedImages = selectedEmail
+    ? (renderedImagesByEmailId[selectedEmail.id] ?? [])
+    : [];
   const selectedReplies = useMemo(() => {
     if (!selectedEmail || !selectedDetail) return [];
 
@@ -946,6 +1251,60 @@ function App() {
       canceled = true;
     };
   }, [detailsById, selectedEmail]);
+
+  useEffect(() => {
+    if (!selectedEmail || selectedInlineImages.length === 0) return;
+    if (renderedImagesByEmailId[selectedEmail.id]) return;
+
+    let canceled = false;
+    const email = selectedEmail;
+    const emailId = email.id;
+
+    async function loadImages() {
+      try {
+        const attachments =
+          attachmentsByEmailId[emailId] ??
+          selectedDetail?.attachments ??
+          email.attachments ??
+          [];
+        const rendered = (
+          await Promise.allSettled(
+            selectedInlineImages.map((image) =>
+              renderInlineImage(image, attachments),
+            ),
+          )
+        ).map((result) =>
+          result.status === "fulfilled" ? result.value : null,
+        );
+
+        if (canceled) return;
+
+        setRenderedImagesByEmailId((current) => ({
+          ...current,
+          [emailId]: rendered,
+        }));
+      } catch {
+        if (!canceled) {
+          setRenderedImagesByEmailId((current) => ({
+            ...current,
+            [emailId]: [],
+          }));
+        }
+      }
+    }
+
+    void loadImages();
+
+    return () => {
+      canceled = true;
+    };
+  }, [
+    attachmentsByEmailId,
+    renderedImagesByEmailId,
+    selectedDetail?.attachments,
+    selectedEmail,
+    selectedInlineImages,
+  ]);
 
   useEffect(() => {
     if (!selectedDetail?.message_id) {
@@ -1585,6 +1944,139 @@ function App() {
     }
   });
 
+  const renderDisplayLine = (line: EmailDisplayLine, lineIndex: number) => {
+    if (line.kind === "image") {
+      const image = selectedRenderedImages[line.imageIndex];
+      const fallback = selectedInlineImages[line.imageIndex];
+
+      if (!image) {
+        return (
+          <text
+            key={`${selectedEmail?.id ?? "email"}-${lineIndex}`}
+            fg={backgroundFg("#565f89")}
+          >
+            [loading image: {fallback?.alt || "image"}]
+          </text>
+        );
+      }
+
+      return (
+        <box
+          key={`${selectedEmail?.id ?? "email"}-${lineIndex}`}
+          marginY={1}
+          flexDirection="column"
+        >
+          {image.lines.map((row, rowIndex) => (
+            <text
+              key={`${selectedEmail?.id ?? "email"}-${lineIndex}-${rowIndex}`}
+              wrapMode="none"
+            >
+              {row.map((pixel, pixelIndex) => (
+                <span
+                  key={`${selectedEmail?.id ?? "email"}-${lineIndex}-${rowIndex}-${pixelIndex}`}
+                  fg={pixel.top}
+                  bg={pixel.bottom}
+                >
+                  {"▀"}
+                </span>
+              ))}
+            </text>
+          ))}
+        </box>
+      );
+    }
+
+    if (line.kind === "link") {
+      return (
+        <text
+          key={`${selectedEmail?.id ?? "email"}-${lineIndex}`}
+          fg={backgroundFg("#9ece6a")}
+          attributes={4}
+          marginTop={lineIndex > 0 ? 1 : 0}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openUrl(line.href);
+            notify("success", `Opened ${line.href}`);
+          }}
+        >
+          {line.label}
+        </text>
+      );
+    }
+
+    const text = line.text;
+    const matches = [...text.matchAll(URL_PATTERN)];
+
+    if (matches.length === 0) {
+      return (
+        <text
+          key={`${selectedEmail?.id ?? "email"}-${lineIndex}`}
+          fg={backgroundFg("#c0caf5")}
+          wrapMode="word"
+        >
+          {text || " "}
+        </text>
+      );
+    }
+
+    const parts: React.ReactNode[] = [];
+    let cursor = 0;
+
+    for (const match of matches) {
+      const rawUrl = match[0]!;
+      const index = match.index ?? 0;
+      const url = normalizeUrl(rawUrl);
+      const trailing = rawUrl.slice(url.length);
+
+      if (index > cursor) {
+        parts.push(text.slice(cursor, index));
+      }
+
+      parts.push(
+        <text
+          key={`${lineIndex}-${index}`}
+          fg={backgroundFg("#7dcfff")}
+          attributes={4}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openUrl(url);
+            notify("success", `Opened ${url}`);
+          }}
+        >
+          {url}
+        </text>,
+      );
+
+      if (trailing) parts.push(trailing);
+      cursor = index + rawUrl.length;
+    }
+
+    if (cursor < text.length) parts.push(text.slice(cursor));
+
+    return (
+      <box
+        key={`${selectedEmail?.id ?? "email"}-${lineIndex}`}
+        flexDirection="row"
+        flexWrap="wrap"
+      >
+        {parts.map((part, index) =>
+          typeof part === "string" ? (
+            <text
+              key={`${lineIndex}-text-${index}`}
+              fg={backgroundFg("#c0caf5")}
+            >
+              {part}
+            </text>
+          ) : (
+            part
+          ),
+        )}
+      </box>
+    );
+  };
+
   return (
     <box
       width={"100%"}
@@ -1606,14 +2098,16 @@ function App() {
         flexDirection="column"
       >
         <box
+          height={2}
+          flexDirection="column"
           onMouseDown={() => {
             void refreshInbox();
           }}
         >
-          <ascii-font marginBottom={1} font="tiny" text="Milo" color={backgroundFg("#c0caf5")} />
+          <ascii-font font="tiny" text="Milo" color={backgroundFg("#c0caf5")} />
         </box>
         <text
-          marginTop={2}
+          marginTop={1}
           fg={backgroundFg(state.status === "error" ? "#f7768e" : "#9ece6a")}
           wrapMode="word"
           height={2}
@@ -1728,15 +2222,7 @@ function App() {
               flexDirection="column"
             >
               {selectedDetail ? (
-                bodyLines.map((line, index) => (
-                  <text
-                    key={`${selectedEmail.id}-${index}`}
-                    fg={backgroundFg("#c0caf5")}
-                    wrapMode="word"
-                  >
-                    {line || " "}
-                  </text>
-                ))
+                displayLines.map((line, index) => renderDisplayLine(line, index))
               ) : (
                 <text fg={backgroundFg("#e0af68")}>
                   Loading selected email...
@@ -2070,34 +2556,12 @@ function App() {
           border
           paddingX={2}
           paddingY={1}
-          borderColor={
-            notification.tone === "error"
-              ? "#f7768e"
-              : notification.tone === "success"
-                ? "#9ece6a"
-                : "#7aa2f7"
-          }
+          backgroundColor={notificationBackground(notification.tone)}
+          borderColor={notificationForeground(notification.tone)}
         >
-          <box
-            position="absolute"
-            left={1}
-            right={1}
-            top={1}
-            bottom={1}
-            flexDirection="column"
-          >
-            <text>{" ".repeat(40)}</text>
-            <text>{" ".repeat(40)}</text>
-            <text>{" ".repeat(40)}</text>
-          </box>
           <text
-            fg={
-              notification.tone === "error"
-                ? "#f7768e"
-                : notification.tone === "success"
-                  ? "#9ece6a"
-                  : "#7aa2f7"
-            }
+            fg={notificationForeground(notification.tone)}
+            bg={notificationBackground(notification.tone)}
             wrapMode="word"
           >
             {notification.message}
