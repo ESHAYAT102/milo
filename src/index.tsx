@@ -272,8 +272,7 @@ const CSS_TOKEN_PATTERN =
   /\b(?:background(?:-color)?|border(?:-(?:bottom|color|radius|top))?|color|font(?:-(?:family|size|weight))?|line-height|margin|padding|text-decoration)\s*:|!important|@media\b|(?:^|\s)[.#][a-z0-9_-]+\s*\{/gi;
 const CSS_BLOCK_START_PATTERN =
   /(?:^|\n)\s*(?:@(?:font-face|media|supports|keyframes)[^{]*|(?:[#.][\w-]+|\[[^\]]+\]|(?:a|article|body|button|div|footer|h[1-6]|header|html|img|li|main|ol|p|section|span|table|tbody|td|th|thead|tr|ul)\b)(?:[\s>+~:,.[#\]\(\)"'=\w-])*)\s*\{/gi;
-const CSS_DECLARATION_LINE_PATTERN =
-  /^\s*(?:[-\w]+)\s*:\s*[^;\n]+;?\s*$/;
+const CSS_DECLARATION_LINE_PATTERN = /^\s*(?:[-\w]+)\s*:\s*[^;\n]+;?\s*$/;
 
 function decodeHtmlEntities(value: string): string {
   return value.replace(
@@ -310,7 +309,7 @@ function stripCssRules(value: string): string {
   const withoutTaggedCss = value
     .replace(/<style\b[\s\S]*?(?:<\/style>|$)/gi, "")
     .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, "")
-    .replace(/<head\b[\s\S]*?(?:<\/head>|$)/gi, "")
+    .replace(/<head\b[\s\S]*?(?:<\/head>|$)/gi, "");
 
   let index = 0;
   let clean = "";
@@ -780,7 +779,10 @@ async function loadSentRepliesCache(): Promise<SentRepliesCache> {
 
 async function saveSentRepliesCache(cache: SentRepliesCache): Promise<void> {
   await mkdir(MILO_DIR, { recursive: true });
-  await writeFile(SENT_REPLIES_CACHE_PATH, `${JSON.stringify(cache, null, 2)}\n`);
+  await writeFile(
+    SENT_REPLIES_CACHE_PATH,
+    `${JSON.stringify(cache, null, 2)}\n`,
+  );
 }
 
 function formatAddressList(addresses: string[] | null | undefined): string {
@@ -1047,12 +1049,11 @@ function App() {
     return [
       ...receivedReplies,
       ...(sentRepliesByEmailId[selectedEmail.id] ?? []),
-    ]
-      .sort(
-        (left, right) =>
-          new Date(left.created_at).getTime() -
-          new Date(right.created_at).getTime(),
-      );
+    ].sort(
+      (left, right) =>
+        new Date(left.created_at).getTime() -
+        new Date(right.created_at).getTime(),
+    );
   }, [
     detailsById,
     emails,
@@ -1330,9 +1331,7 @@ function App() {
     }
     setRepliesLoading(true);
 
-    Promise.allSettled(
-      missingEmails.map((email) => getReceivedEmail(email.id)),
-    )
+    Promise.allSettled(missingEmails.map((email) => getReceivedEmail(email.id)))
       .then((results) => {
         if (canceled) return;
 
@@ -1468,10 +1467,7 @@ function App() {
     const trimmedReplyFromAddress = replyFromAddress.trim();
 
     if (!trimmedReplyFromAddress) {
-      notify(
-        "error",
-        "Set POP_FROM or select an email with a To address",
-      );
+      notify("error", "Set POP_FROM or select an email with a To address");
       return;
     }
 
@@ -1630,10 +1626,7 @@ function App() {
     (direction: -1 | 1) => {
       if (emails.length === 0) return;
 
-      const nextIndex = clampIndex(
-        selectedIndex + direction,
-        emails.length,
-      );
+      const nextIndex = clampIndex(selectedIndex + direction, emails.length);
 
       setSelectedIndex(nextIndex);
     },
@@ -1648,10 +1641,13 @@ function App() {
     [syncSelectedDetailScroll],
   );
 
-  const scrollSelectedDetailTo = useCallback((position: number) => {
-    detailScrollRef.current?.scrollTo(position);
-    syncSelectedDetailScroll();
-  }, [syncSelectedDetailScroll]);
+  const scrollSelectedDetailTo = useCallback(
+    (position: number) => {
+      detailScrollRef.current?.scrollTo(position);
+      syncSelectedDetailScroll();
+    },
+    [syncSelectedDetailScroll],
+  );
 
   const sendComposedEmail = useCallback(async () => {
     const body = composeBodyRef.current?.plainText.trim() ?? "";
@@ -2078,12 +2074,7 @@ function App() {
   };
 
   return (
-    <box
-      width={"100%"}
-      height={"100%"}
-      flexDirection="row"
-      gap={2}
-    >
+    <box width={"100%"} height={"100%"} flexDirection="row" gap={2}>
       <box
         width={36}
         border
@@ -2094,7 +2085,8 @@ function App() {
         }
         focusedBorderColor={ACTIVE_PANE_BORDER_COLOR}
         paddingX={2}
-        paddingY={1}
+        paddingTop={1}
+        paddingBottom={1}
         flexDirection="column"
       >
         <box
@@ -2104,7 +2096,12 @@ function App() {
             void refreshInbox();
           }}
         >
-          <ascii-font font="tiny" text="Milo" color={backgroundFg("#c0caf5")} />
+          <ascii-font
+            font="tiny"
+            text="Milo"
+            marginBottom={1}
+            color={backgroundFg("#c0caf5")}
+          />
         </box>
         <text
           marginTop={1}
@@ -2222,7 +2219,9 @@ function App() {
               flexDirection="column"
             >
               {selectedDetail ? (
-                displayLines.map((line, index) => renderDisplayLine(line, index))
+                displayLines.map((line, index) =>
+                  renderDisplayLine(line, index),
+                )
               ) : (
                 <text fg={backgroundFg("#e0af68")}>
                   Loading selected email...
