@@ -116,6 +116,35 @@ type EmailDisplayLine =
   | { kind: "link"; label: string; href: string }
   | { kind: "image"; imageIndex: number };
 
+let renderer: Awaited<ReturnType<typeof createCliRenderer>> | null = null;
+let isQuitting = false;
+
+function exitAfterCleanup(code: number): void {
+  setTimeout(() => {
+    process.exit(code);
+  }, 0);
+}
+
+function quit(code: number): void {
+  if (isQuitting) return;
+  isQuitting = true;
+
+  const finish = () => exitAfterCleanup(code);
+
+  if (!renderer || renderer.isDestroyed) {
+    finish();
+    return;
+  }
+
+  renderer.once("destroy", finish);
+
+  try {
+    renderer.destroy();
+  } catch {
+    finish();
+  }
+}
+
 function dimHexColor(color: string): string {
   const match = /^#([0-9a-f]{6})$/i.exec(color);
 
@@ -1916,7 +1945,8 @@ function App() {
       key.name === "escape" ||
       (key.ctrl && key.name === "c")
     ) {
-      process.exit(0);
+      key.preventDefault();
+      quit(0);
     }
 
     if (key.name === "r") {
@@ -2571,5 +2601,5 @@ function App() {
   );
 }
 
-const renderer = await createCliRenderer();
+renderer = await createCliRenderer({ exitOnCtrlC: false });
 createRoot(renderer).render(<App />);
